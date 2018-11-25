@@ -24,7 +24,7 @@ static void doSomeWork()
   if (n == 0) {
     u8x8.drawString(0, 0, "Searching networks.");
   } else {
-    u8x8.drawString(0, 0, "Networks found! ");
+    u8x8.drawString(0, 0, "Networks found.");
     for (int i = 0; i < n; ++i) {
       // Print SSID for each network found
       char currentSSID[64];
