@@ -69,7 +69,7 @@ void writeRow(int row, const char* msg)
 }
 
 
-const char* GetWiFiEventDesc(WiFiEvent_t event)
+const char* GetWiFiEventDesc(int event)
 {
   if(event == SYSTEM_EVENT_WIFI_READY) { return "SYSTEM_EVENT_WIFI_READY"; }
   if(event == SYSTEM_EVENT_SCAN_DONE) { return "SYSTEM_EVENT_SCAN_DONE"; }
@@ -94,7 +94,7 @@ const char * system_event_reasons[] = { "UNSPECIFIED", "AUTH_EXPIRE", "AUTH_LEAV
 
 void LogWiFiEvent(WiFiEvent_t event, system_event_info_t info)
 {
-  Serial.print("WiFiEvent: ");
+  Serial.print("-> WiFiEvent: ");
   Serial.print(event);
   Serial.print(": ");
   Serial.print(GetWiFiEventDesc(event));
@@ -102,7 +102,7 @@ void LogWiFiEvent(WiFiEvent_t event, system_event_info_t info)
   if(event == SYSTEM_EVENT_STA_DISCONNECTED)
   {
     auto disconnectInfo = info.disconnected;
-    Serial.print("-> Reason: ");
+    Serial.print("--> Reason: ");
     Serial.print(disconnectInfo.reason);
     Serial.print(": ");
     Serial.println(reason2str(disconnectInfo.reason));
@@ -110,7 +110,7 @@ void LogWiFiEvent(WiFiEvent_t event, system_event_info_t info)
   else if(event == SYSTEM_EVENT_STA_CONNECTED)
   {
     auto connectInfo = info.connected;
-    Serial.print("-> SSID: ");
+    Serial.print("--> SSID: ");
     char ssid[32];
     memset(ssid, 0, 32);
     for(int i = 0; i < connectInfo.ssid_len; ++i)
@@ -122,7 +122,7 @@ void LogWiFiEvent(WiFiEvent_t event, system_event_info_t info)
   else if(event == SYSTEM_EVENT_STA_GOT_IP)
   {
     auto ip = info.got_ip.ip_info.ip;
-    Serial.print("-> IP: ");
+    Serial.print("--> IP: ");
     Serial.print(ip4_addr1(&ip));
     Serial.print(".");
     Serial.print(ip4_addr2(&ip));
@@ -180,14 +180,16 @@ void WiFiEventWps(WiFiEvent_t event, system_event_info_t info){
   }
 }
 
+int lastConnectionEvent = -1;
 void WiFiEventConnection(WiFiEvent_t event, system_event_info_t info)
 {
+  lastConnectionEvent = event;
   LogWiFiEvent(event, info);
 }
 
 void setup(){
   Serial.begin(115200);
-  Serial.setDebugOutput(1);
+  Serial.setDebugOutput(true);
   delay(100);
 
   u8x8.begin();
@@ -268,9 +270,24 @@ void hard_restart() {
  */
 
 int connectCount = 0;
+int noStatusUpdateCount = 0;
 int prev_status = -1;
+
+void enterLockupIfRunningForTooLong()
+{
+  const int MAX_LENGTH_BEFORE_LOCKUP = 30000;
+
+  if(millis() > MAX_LENGTH_BEFORE_LOCKUP)
+  {
+    Serial.printf("Have been running past limit of %i: holding so output can be examined\n", MAX_LENGTH_BEFORE_LOCKUP);
+    for(;;) {}
+  }
+}
+
 void maintainConnection()
 {
+  enterLockupIfRunningForTooLong();
+  
   delay(1000 * wifiBeginRetryIntervalSecs);
   int status = WiFi.status();
   if(status != WL_CONNECTED || status != prev_status)
@@ -282,26 +299,42 @@ void maintainConnection()
   {
     if(status != WL_CONNECTED)
     {
-      Serial.print("Not Connected, Status: ");
-      Serial.print(status);
-      Serial.print(": ");
-      Serial.println(descForStatusCode(status));
-      
-      if(wifiBeginRetryIntervalSecs < 8)
+      Serial.printf("Status: %i (%s)\n", status, descForStatusCode(status));
+
+      if(lastConnectionEvent != -1)
       {
-        wifiBeginRetryIntervalSecs++;
+        noStatusUpdateCount = 0;
+        Serial.printf("New lastConnectionEvent: %i (%s)\n", lastConnectionEvent, GetWiFiEventDesc(lastConnectionEvent));
+        if(lastConnectionEvent != SYSTEM_EVENT_STA_CONNECTED && lastConnectionEvent != SYSTEM_EVENT_STA_GOT_IP)
+        {
+          int reconnectStatus = WiFi.reconnect();          
+          Serial.printf("Called WiFi.reconnect(), got %i\n", reconnectStatus);
+        }
+        lastConnectionEvent = -1;
       }
-      int beginStatus = WiFi.begin();
-      Serial.println("Called WiFi.begin() for retry");
+      else
+      {
+        noStatusUpdateCount++;
+        if(noStatusUpdateCount == 5)
+        {
+          Serial.printf("No new event for %i seconds - calling WiFi.reconnect()\n", noStatusUpdateCount);
+          noStatusUpdateCount = 0;
+          int reconnectStatus = WiFi.reconnect();          
+          Serial.printf("Called WiFi.reconnect(), got %i\n", reconnectStatus);
+        }
+      }
       writeRow(1, descForStatusCode(status));
     }
     else
     {
+      Serial.print(".");
       wifiBeginRetryIntervalSecs = 1;
       connectCount++;
-      if(connectCount == 5)
+      if(connectCount == 3)
       {
-        Serial.println("We have a stable connection: trying again");
+        Serial.print("We have a stable connection after ");
+        Serial.print(millis());
+        Serial.println("ms: trying again");
         hard_restart();
       }
     }
