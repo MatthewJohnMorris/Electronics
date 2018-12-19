@@ -85,8 +85,30 @@ const char* GetWiFiEventDesc(int event)
   return "UNKNOWN";
 }
 
-const char * system_event_reasons[] = { "UNSPECIFIED", "AUTH_EXPIRE", "AUTH_LEAVE", "ASSOC_EXPIRE", "ASSOC_TOOMANY", "NOT_AUTHED", "NOT_ASSOCED", "ASSOC_LEAVE", "ASSOC_NOT_AUTHED", "DISASSOC_PWRCAP_BAD", "DISASSOC_SUPCHAN_BAD", "UNSPECIFIED", "IE_INVALID", "MIC_FAILURE", "4WAY_HANDSHAKE_TIMEOUT", "GROUP_KEY_UPDATE_TIMEOUT", "IE_IN_4WAY_DIFFERS", "GROUP_CIPHER_INVALID", "PAIRWISE_CIPHER_INVALID", "AKMP_INVALID", "UNSUPP_RSN_IE_VERSION", "INVALID_RSN_IE_CAP", "802_1X_AUTH_FAILED", "CIPHER_SUITE_REJECTED", "BEACON_TIMEOUT", "NO_AP_FOUND", "AUTH_FAIL", "ASSOC_FAIL", "HANDSHAKE_TIMEOUT" };
-#define reason2str(r) ((r>176)?system_event_reasons[r-176]:system_event_reasons[r-1])
+// https://github.com/espressif/esp-idf/blob/master/components/esp32/include/esp_wifi_types.h
+const char * system_event_reasons[] = { 
+  "UNSPECIFIED", "AUTH_EXPIRE", "AUTH_LEAVE", "ASSOC_EXPIRE", // 4
+  "ASSOC_TOOMANY", "NOT_AUTHED", "NOT_ASSOCED", "ASSOC_LEAVE", // 8
+  "ASSOC_NOT_AUTHED", "DISASSOC_PWRCAP_BAD", "DISASSOC_SUPCHAN_BAD", "UNSPECIFIED", // 12
+  "IE_INVALID", "MIC_FAILURE", "4WAY_HANDSHAKE_TIMEOUT", "GROUP_KEY_UPDATE_TIMEOUT", // 16
+  "IE_IN_4WAY_DIFFERS", "GROUP_CIPHER_INVALID", "PAIRWISE_CIPHER_INVALID", "AKMP_INVALID", // 20 
+  "UNSUPP_RSN_IE_VERSION", "INVALID_RSN_IE_CAP", "802_1X_AUTH_FAILED", "CIPHER_SUITE_REJECTED", //24
+  "BEACON_TIMEOUT", // 200 -> 24
+  "NO_AP_FOUND", "AUTH_FAIL", "ASSOC_FAIL", "HANDSHAKE_TIMEOUT" // 204 
+  };
+
+const char* ReasonDesc(int reason)
+{
+  if(reason >= 200 && reason <= 204)
+  {
+    return system_event_reasons[reason-176];
+  }
+  if(reason > 0 && reason <= 24)
+  {
+    return system_event_reasons[reason-1];
+  }
+  return "UNKNOWN";
+}
 
 void LogWiFiEvent(WiFiEvent_t event, system_event_info_t info)
 {
@@ -94,7 +116,7 @@ void LogWiFiEvent(WiFiEvent_t event, system_event_info_t info)
   if(event == SYSTEM_EVENT_STA_DISCONNECTED)
   {
     auto disconnectInfo = info.disconnected;
-    Serial.printf("--> Reason: %i (%s)\n", disconnectInfo.reason, reason2str(disconnectInfo.reason));
+    Serial.printf("--> Reason: %i (%s)\n", disconnectInfo.reason, ReasonDesc(disconnectInfo.reason));
   }
   else if(event == SYSTEM_EVENT_STA_CONNECTED)
   {
@@ -177,6 +199,7 @@ public:
     Serial.printf("Config SSID: %s\n", configSsid.c_str());      
     auto configPassword = String(reinterpret_cast<char*>(conf.sta.password));
     Serial.printf("Config Password: %s\n", configPassword.c_str());
+    Serial.printf("Config setbssid: %i\n", conf.sta.bssid_set);
 
     Serial.println("scan started");
     int n = WiFi.scanNetworks();
@@ -231,6 +254,40 @@ public:
 
 };
 
+class Restarter
+{
+public:
+  static bool shouldHaveRestarted;
+  static void HardRestart()
+  {
+    // Let our code know we should be dead
+    shouldHaveRestarted = true;
+
+    // set up watchdog to kill us after a second
+    esp_task_wdt_init(1,true);
+    esp_task_wdt_add(NULL);
+
+    // attempt a clean restart
+    ESP.restart();
+
+    // Loop - the watchdog will take care of things
+    // This may be a less clean restart than the other option: in particular, code
+    // may still run in loop() - noticed around 1/500 restarts/
+    while(true);
+  }
+  static void RestartIfWeShouldAlreadyHaveDoneSo()
+  {
+    if(shouldHaveRestarted)
+    {
+      Serial.println("****************************************************");
+      Serial.println("EXTRA RESTART: earlier hard reset failed!!!");
+      Serial.println("****************************************************");
+      HardRestart();
+    }
+  }
+};
+bool Restarter::shouldHaveRestarted = false;
+
 class ConnectionMaintenance
 {
   private:
@@ -238,6 +295,7 @@ class ConnectionMaintenance
     int _prevStatus = -1;
     int _connectCount = 0;
     int _noStatusUpdateCount = 0;
+    int _connectMillis = -1;
     std::shared_ptr<BestConnectionOptions> _pBestConnectionOptions;
     ConnectionEventProcessor& _connectionEventProcessor;
 
@@ -262,9 +320,10 @@ class ConnectionMaintenance
     {
       // int disconnectResult = WiFi.disconnect(); // WiFi.disconnect(wifioff: true, eraseap: false);
       // Serial.printf("Called WiFi.disconnect(), got %i\n", disconnectResult);
-      Serial.printf("Initialised WIFI_OFF, returned %i\n", WiFi.mode(WIFI_OFF));
-      Serial.printf("Initialised WIFI_MODE_STA, returned %i\n", WiFi.mode(WIFI_MODE_STA));
-      Serial.printf("Called WiFi.enableSTA(true), got %i\n", WiFi.enableSTA(true));
+      
+      // Serial.printf("Initialised WIFI_OFF, returned %i\n", WiFi.mode(WIFI_OFF));
+      // Serial.printf("Initialised WIFI_MODE_STA, returned %i\n", WiFi.mode(WIFI_MODE_STA));
+      // Serial.printf("Called WiFi.enableSTA(true), got %i\n", WiFi.enableSTA(true));
       int beginStatus = _pBestConnectionOptions->WiFiBegin();
       Serial.printf("Called WiFi.begin(), got %i (%s)\n", beginStatus, descForStatusCode(beginStatus));
     }
@@ -298,7 +357,7 @@ class ConnectionMaintenance
           Serial.printf("[%i] Not connected, status: %i (%s)\n", _noStatusUpdateCount, status, descForStatusCode(status));
 
           auto lce = _connectionEventProcessor.GetAndClearLastEvent();
-          if(lce != -1)
+          if(lce != -1 && lce != SYSTEM_EVENT_STA_CONNECTED && lce != SYSTEM_EVENT_STA_GOT_IP)
           {
             _noStatusUpdateCount = 0;
             auto hasde = _connectionEventProcessor.GetAndClearHasDisconnectEvent();
@@ -322,26 +381,23 @@ class ConnectionMaintenance
         }
         else
         {
+          if(_connectMillis == -1)
+          {
+            _connectMillis = millis();
+          }
           Serial.print(".");
           _connectCount++;
-          if(_connectCount == 3)
+          if(_connectCount == 2)
           {
             Serial.println("");
             Serial.println("********************************************************************");
-            Serial.printf("We have a stable connection after %i millis: trying again\n", millis());
+            Serial.printf("Got connection after %i ms, reboot after %i ms\n", _connectMillis, millis());
             Serial.println("********************************************************************");
-            hard_restart();
+            Restarter::HardRestart();
           }
         }
       }  
     }
-
-private:
-  static void hard_restart() {
-    esp_task_wdt_init(1,true);
-    esp_task_wdt_add(NULL);
-    while(true);
-  }
 };
 
 std::shared_ptr<ConnectionMaintenance> theConnectionMaintenance;
@@ -457,15 +513,15 @@ void setup(){
     writeRow(0, "Trying to Connect");
     Serial.printf("WiFi.getAutoReconnect() returned %i\n", WiFi.getAutoReconnect());
     WiFi.onEvent(WiFiEventConnection);
-    Serial.printf("Initialised WIFI_OFF, returned %i\n", WiFi.mode(WIFI_OFF));
+    // Serial.printf("Initialised WIFI_OFF, returned %i\n", WiFi.mode(WIFI_OFF));
     Serial.printf("Initialised WIFI_MODE_STA, returned %i\n", WiFi.mode(WIFI_MODE_STA));
   }
 
   std::shared_ptr<BestConnectionOptions> pBestConnectionOptions(new BestConnectionOptions());
   theConnectionMaintenance.reset(new ConnectionMaintenance(pBestConnectionOptions, theConnectionEventProcessor));
 
-  Serial.printf("Called WiFi.enableSTA(false), got %i\n", WiFi.enableSTA(false));
-  Serial.printf("Called WiFi.enableSTA(true), got %i\n", WiFi.enableSTA(true));
+  // Serial.printf("Called WiFi.enableSTA(false), got %i\n", WiFi.enableSTA(false));
+  // Serial.printf("Called WiFi.enableSTA(true), got %i\n", WiFi.enableSTA(true));
   int beginRetCode = pBestConnectionOptions->WiFiBegin();
   Serial.printf("WiFi.begin() returned %i (%s)\n", beginRetCode, descForStatusCode(beginRetCode));
   writeRow(1, descForStatusCode(beginRetCode));
@@ -518,10 +574,12 @@ void initWps()
  ** Reason: 6: NOT_AUTHED
  */
 
-
-
-void loop(){
+void loop()
+{
   delay(1000);
+
+  Restarter::RestartIfWeShouldAlreadyHaveDoneSo();
+  
   if(theConnectionMaintenance.get() != 0)
   {
     theConnectionMaintenance->MaintainConnection();
