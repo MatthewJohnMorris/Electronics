@@ -12,6 +12,7 @@ Pranav Cherukupalli <cherukupallip@gmail.com>
 */
 
 #include "WiFi.h"
+#include "ESPmDNS.h"
 #include "esp_wps.h"
 #include "esp_event.h"
 #include "esp_int_wdt.h"
@@ -291,17 +292,22 @@ bool Restarter::shouldHaveRestarted = false;
 class ConnectionMaintenance
 {
   private:
-    bool _assumeConnection;
+    bool _assumeConnection = false;
     int _prevStatus = -1;
     int _connectCount = 0;
     int _noStatusUpdateCount = 0;
     int _connectMillis = -1;
+    bool _servicesSetUp = false;
     std::shared_ptr<BestConnectionOptions> _pBestConnectionOptions;
     ConnectionEventProcessor& _connectionEventProcessor;
+    std::shared_ptr<WiFiServer> _pWiFiServer;
+
+    const int SERVER_PORT = 80;
 
   public:
     ConnectionMaintenance(std::shared_ptr<BestConnectionOptions> pBestConnectionOptions, ConnectionEventProcessor& connectionEventProcessor)
-    : _assumeConnection(false), _pBestConnectionOptions(pBestConnectionOptions), _connectionEventProcessor(connectionEventProcessor)
+    : _pBestConnectionOptions(pBestConnectionOptions),
+      _connectionEventProcessor(connectionEventProcessor)
     {
     }
     
@@ -316,6 +322,34 @@ class ConnectionMaintenance
     }
 
   private:
+    void setUpServicesUponConnection()
+    {
+      // Set up mDNS responder:
+      // - first argument is the domain name, in this example
+      //   the fully-qualified domain name is "esp8266.local"
+      // - second argument is the IP address to advertise
+      //   we send our IP address on the WiFi network
+      if (!MDNS.begin("esp32")) {
+          Serial.println("Error setting up MDNS responder!");
+          while(1) {
+              delay(1000);
+          }
+      }
+      Serial.println("mDNS responder started");
+
+      // Onlt (re)create this once WiFi is up because otherwise it'll have issues
+      _pWiFiServer = std::shared_ptr<WiFiServer>(new WiFiServer(SERVER_PORT));
+      _pWiFiServer->begin();
+      Serial.printf("TCP server started\n");
+
+      // Add service to MDNS-SD
+      MDNS.addService("http", "tcp", 80);
+      Serial.printf("Added MDNS-SD server http:tcp:80\n");
+
+      _servicesSetUp = true;
+    }
+
+  private:
     void disconnectAndBegin()
     {
       // int disconnectResult = WiFi.disconnect(); // WiFi.disconnect(wifioff: true, eraseap: false);
@@ -324,6 +358,22 @@ class ConnectionMaintenance
       // Serial.printf("Initialised WIFI_OFF, returned %i\n", WiFi.mode(WIFI_OFF));
       // Serial.printf("Initialised WIFI_MODE_STA, returned %i\n", WiFi.mode(WIFI_MODE_STA));
       // Serial.printf("Called WiFi.enableSTA(true), got %i\n", WiFi.enableSTA(true));
+
+      if(_servicesSetUp)
+      {
+        if(_pWiFiServer.get())
+        {
+          _pWiFiServer->end();
+          _pWiFiServer = 0;
+          Serial.printf("TCP server stopped\n");
+        }
+      
+        MDNS.end();
+        Serial.printf("MDNS server stopped\n");
+
+        _servicesSetUp = false;
+      }
+      
       int beginStatus = _pBestConnectionOptions->WiFiBegin();
       Serial.printf("Called WiFi.begin(), got %i (%s)\n", beginStatus, descForStatusCode(beginStatus));
     }
@@ -331,12 +381,86 @@ class ConnectionMaintenance
     static void enterLockupIfRunningForTooLong()
     {
       const int MAX_LENGTH_BEFORE_LOCKUP = 60000;
-  
+  /*
       if(millis() > MAX_LENGTH_BEFORE_LOCKUP)
       {
         Serial.printf("Have been running past limit of %i: holding so output can be examined\n", MAX_LENGTH_BEFORE_LOCKUP);
         for(;;) {}
       }
+    */
+    }
+
+    int _serviceClientRequestCalls = 0;
+    
+public:
+    void serviceClientRequests(void)
+    {
+      _serviceClientRequestCalls++;
+      if(_serviceClientRequestCalls % 1000000 == 0)
+      {
+        Serial.printf("Service calls: %i\n", _serviceClientRequestCalls);
+      }
+      
+      // Check if a client has connected
+      if(! _pWiFiServer.get())
+      {
+        return;
+      }
+      WiFiClient client = _pWiFiServer->available();
+      if (!client) {
+          return;
+      }
+      Serial.println("");
+      Serial.println("New client");
+  
+      // Wait for data from client to become available
+      while(client.connected() && !client.available()){
+          delay(1);
+      }
+  
+      // Read the first line of HTTP request
+      Serial.printf("before read client.connected = %i\n", client.connected());
+      String req = client.readStringUntil('\r');
+      Serial.printf("after read client.connected = %i\n", client.connected());
+  
+      // First line of HTTP request looks like "GET /path HTTP/1.1"
+      // Retrieve the "/path" part by finding the spaces
+      int addr_start = req.indexOf(' ');
+      int addr_end = req.indexOf(' ', addr_start + 1);
+      if (addr_start == -1 || addr_end == -1) {
+          Serial.print("Invalid request: ");
+          Serial.println(req);
+          return;
+      }
+      req = req.substring(addr_start + 1, addr_end);
+      Serial.print("Request: ");
+      Serial.println(req);
+  
+      String s;
+      if (req == "/")
+      {
+          IPAddress ip = WiFi.localIP();
+          String ipStr = String(ip[0]) + '.' + String(ip[1]) + '.' + String(ip[2]) + '.' + String(ip[3]);
+          s = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<!DOCTYPE HTML>\r\n<html>Hello from ESP32 at ";
+          s += ipStr;
+          s += "</html>\r\n\r\n";
+          Serial.println("Sending 200");
+      }
+      else
+      {
+          s = "HTTP/1.1 404 Not Found\r\n\r\n";
+          Serial.println("Sending 404");
+      }
+      Serial.printf("client.connected = %i\n", client.connected());
+      int written = client.print(s);
+      Serial.printf("Wrote %i bytes to client\n", written);
+  
+      // Flush kills the socket so don't call until we are done
+      Serial.printf("before flush client.connected = %i\n", client.connected());
+      client.flush();
+      Serial.printf("after flush client.connected = %i\n", client.connected());
+  
+      Serial.println("Done with client");
     }
 
   public:
@@ -349,7 +473,7 @@ class ConnectionMaintenance
       {
         showConnectionStatus(status);
       }
-      _prevStatus = status;
+      
       if(_assumeConnection)
       {
         if(status != WL_CONNECTED)
@@ -378,15 +502,25 @@ class ConnectionMaintenance
             }
           }
           writeRow(1, descForStatusCode(status));
-        }
+        } // not connected
         else
         {
+          if(_prevStatus != WL_CONNECTED)
+          {
+            Serial.printf("Setting up services upon initial connection\n");
+            setUpServicesUponConnection();  
+          }
+
+          // Serial.printf("r");
+          serviceClientRequests();
+          
           if(_connectMillis == -1)
           {
             _connectMillis = millis();
           }
-          Serial.print(".");
+          // Serial.printf("c");
           _connectCount++;
+          /*
           if(_connectCount == 2)
           {
             Serial.println("");
@@ -395,8 +529,17 @@ class ConnectionMaintenance
             Serial.println("********************************************************************");
             Restarter::HardRestart();
           }
-        }
-      }  
+          */
+        } // connected
+        
+      } // _assumeConnection
+      _prevStatus = status;
+      
+    }
+
+    bool isConnected()
+    {
+      return _prevStatus == WL_CONNECTED;
     }
 };
 
@@ -576,7 +719,10 @@ void initWps()
 
 void loop()
 {
-  delay(1000);
+  if(! theConnectionMaintenance->isConnected())
+  {
+    delay(1000);
+  }
 
   Restarter::RestartIfWeShouldAlreadyHaveDoneSo();
   
