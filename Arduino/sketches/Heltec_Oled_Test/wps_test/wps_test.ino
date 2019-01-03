@@ -18,6 +18,7 @@ Pranav Cherukupalli <cherukupallip@gmail.com>
 #include "esp_int_wdt.h"
 #include "esp_task_wdt.h"
 #include "esp_wifi.h"
+#include "esp.h"
 
 #include <U8x8lib.h>
 
@@ -289,6 +290,43 @@ public:
 };
 bool Restarter::shouldHaveRestarted = false;
 
+class IWebResponder
+{
+  public:
+    virtual String Respond(const String& request) = 0;
+    virtual ~IWebResponder() {}
+};
+
+class Esp32WebResponder : public IWebResponder
+{
+  private:
+    String Respond(const String& request)
+    {
+      if (request == "/")
+      {
+          IPAddress ip = WiFi.localIP();
+          String ipStr = String(ip[0]) + '.' + String(ip[1]) + '.' + String(ip[2]) + '.' + String(ip[3]);
+          String s = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<!DOCTYPE HTML>\r\n<html>";
+          s += "Hello from ESP32 at ";
+          s += ipStr;
+          s += "<br><br>";
+          s += "<form action=\"\">";
+          s += "<input type=\"text\" name=\"colour\" value=\"red\">";
+          s += "<br><br>";
+          s += "<input type=\"text\" name=\"brightness\" value=\"10\">";
+          s += "<br><br>";
+          s += "<input type=\"submit\" value=\"Submit\"></form>";
+          s += "</html>\r\n\r\n";
+          return s;
+      }
+      else
+      {
+          String s = "HTTP/1.1 404 Not Found\r\n\r\n";
+          return s;
+      }
+    }
+};
+
 class ConnectionMaintenance
 {
   private:
@@ -299,14 +337,19 @@ class ConnectionMaintenance
     int _connectMillis = -1;
     bool _servicesSetUp = false;
     std::shared_ptr<BestConnectionOptions> _pBestConnectionOptions;
+    std::shared_ptr<IWebResponder> _pWebResponder;
     ConnectionEventProcessor& _connectionEventProcessor;
     std::shared_ptr<WiFiServer> _pWiFiServer;
 
     const int SERVER_PORT = 80;
 
   public:
-    ConnectionMaintenance(std::shared_ptr<BestConnectionOptions> pBestConnectionOptions, ConnectionEventProcessor& connectionEventProcessor)
+    ConnectionMaintenance(
+      std::shared_ptr<BestConnectionOptions> pBestConnectionOptions, 
+      std::shared_ptr<IWebResponder> pWebResponder,
+      ConnectionEventProcessor& connectionEventProcessor)
     : _pBestConnectionOptions(pBestConnectionOptions),
+      _pWebResponder(pWebResponder),
       _connectionEventProcessor(connectionEventProcessor)
     {
     }
@@ -322,27 +365,34 @@ class ConnectionMaintenance
     }
 
   private:
+  
     void setUpServicesUponConnection()
-    {
-      // Set up mDNS responder:
-      // - first argument is the domain name, in this example
-      //   the fully-qualified domain name is "esp8266.local"
-      // - second argument is the IP address to advertise
-      //   we send our IP address on the WiFi network
-      if (!MDNS.begin("esp32")) {
-          Serial.println("Error setting up MDNS responder!");
+    { 
+      // MAC is 48 bits = 12 hex
+      uint64_t chipId = ESP.getEfuseMac(); 
+      uint16_t chipIdHi16 = (uint16_t)(chipId >> 32);
+      uint32_t chipIdLo32 = (uint32_t)chipId;
+      
+      // Set up mDNS responder with name "esp32-{MAC}"
+      char chipIdStr[32];
+      snprintf(chipIdStr, 32, "esp32-%04X%08X", chipIdHi16, chipIdLo32);
+      Serial.printf("mDNS name = '%s'\n", chipIdStr);
+      if (!MDNS.begin(chipIdStr)) {
+          Serial.println("Error setting up mDNS responder!");
           while(1) {
               delay(1000);
           }
       }
       Serial.println("mDNS responder started");
 
-      // Onlt (re)create this once WiFi is up because otherwise it'll have issues
+      // Only (re)create WiFiServer once WiFi is up because otherwise
+      // it'll have issues - in particular we aren't supposed to keep sockets around
+      // WiFi connections
       _pWiFiServer = std::shared_ptr<WiFiServer>(new WiFiServer(SERVER_PORT));
       _pWiFiServer->begin();
       Serial.printf("TCP server started\n");
 
-      // Add service to MDNS-SD
+      // Add service to MDNS-SD - this will make us come up on mDNS-aware browsers
       MDNS.addService("http", "tcp", 80);
       Serial.printf("Added MDNS-SD server http:tcp:80\n");
 
@@ -410,8 +460,7 @@ public:
       if (!client) {
           return;
       }
-      Serial.println("");
-      Serial.println("New client");
+      Serial.printf("\nNew client\n");
   
       // Wait for data from client to become available
       while(client.connected() && !client.available()){
@@ -419,40 +468,23 @@ public:
       }
   
       // Read the first line of HTTP request
-      Serial.printf("before read client.connected = %i\n", client.connected());
       String req = client.readStringUntil('\r');
-      Serial.printf("after read client.connected = %i\n", client.connected());
   
       // First line of HTTP request looks like "GET /path HTTP/1.1"
       // Retrieve the "/path" part by finding the spaces
       int addr_start = req.indexOf(' ');
       int addr_end = req.indexOf(' ', addr_start + 1);
       if (addr_start == -1 || addr_end == -1) {
-          Serial.print("Invalid request: ");
-          Serial.println(req);
+          Serial.printf("Invalid request: '%s'", req.c_str());
           return;
       }
+      Serial.printf("Full Request: '%s'\n", req.c_str());
       req = req.substring(addr_start + 1, addr_end);
-      Serial.print("Request: ");
-      Serial.println(req);
-  
-      String s;
-      if (req == "/")
-      {
-          IPAddress ip = WiFi.localIP();
-          String ipStr = String(ip[0]) + '.' + String(ip[1]) + '.' + String(ip[2]) + '.' + String(ip[3]);
-          s = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<!DOCTYPE HTML>\r\n<html>Hello from ESP32 at ";
-          s += ipStr;
-          s += "</html>\r\n\r\n";
-          Serial.println("Sending 200");
-      }
-      else
-      {
-          s = "HTTP/1.1 404 Not Found\r\n\r\n";
-          Serial.println("Sending 404");
-      }
-      Serial.printf("client.connected = %i\n", client.connected());
-      int written = client.print(s);
+      Serial.printf("Parsed Request: '%s'\n", req.c_str());
+
+      String response = _pWebResponder->Respond(req);
+      
+      int written = client.print(response);
       Serial.printf("Wrote %i bytes to client\n", written);
   
       // Flush kills the socket so don't call until we are done
@@ -464,7 +496,7 @@ public:
     }
 
   public:
-    void MaintainConnection()
+    void acquireAndMaintainConnection()
     {
       enterLockupIfRunningForTooLong();
       
@@ -661,7 +693,12 @@ void setup(){
   }
 
   std::shared_ptr<BestConnectionOptions> pBestConnectionOptions(new BestConnectionOptions());
-  theConnectionMaintenance.reset(new ConnectionMaintenance(pBestConnectionOptions, theConnectionEventProcessor));
+  std::shared_ptr<IWebResponder> pWebResponder(new Esp32WebResponder());
+  theConnectionMaintenance.reset(
+    new ConnectionMaintenance(
+      pBestConnectionOptions, 
+      pWebResponder,
+      theConnectionEventProcessor));
 
   // Serial.printf("Called WiFi.enableSTA(false), got %i\n", WiFi.enableSTA(false));
   // Serial.printf("Called WiFi.enableSTA(true), got %i\n", WiFi.enableSTA(true));
@@ -719,15 +756,15 @@ void initWps()
 
 void loop()
 {
-  if(! theConnectionMaintenance->isConnected())
-  {
-    delay(1000);
-  }
-
   Restarter::RestartIfWeShouldAlreadyHaveDoneSo();
   
   if(theConnectionMaintenance.get() != 0)
   {
-    theConnectionMaintenance->MaintainConnection();
+    if(! theConnectionMaintenance->isConnected())
+    {
+      delay(1000);
+    }
+
+    theConnectionMaintenance->acquireAndMaintainConnection();
   }
 }
