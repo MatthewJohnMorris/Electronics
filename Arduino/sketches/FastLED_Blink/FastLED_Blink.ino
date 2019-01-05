@@ -1,7 +1,7 @@
 #include <FastLED.h>
 
 // How many leds in your strip?
-#define NUM_LEDS 1
+#define NUM_LEDS 4
 
 // For led chips like Neopixels, which have a data line, ground, and power, you just
 // need to define DATA_PIN.  For led chipsets that are SPI based (four wires - data, clock,
@@ -39,7 +39,7 @@ void setup() {
 
       // FastLED.addLeds<WS2801, DATA_PIN, CLOCK_PIN, RGB>(leds, NUM_LEDS);
       // FastLED.addLeds<SM16716, DATA_PIN, CLOCK_PIN, RGB>(leds, NUM_LEDS);
-      FastLED.addLeds<LPD8806, DATA_PIN, CLOCK_PIN, RGB>(leds, NUM_LEDS);
+      FastLED.addLeds<LPD8806, DATA_PIN, CLOCK_PIN, BRG>(leds, NUM_LEDS);
       // FastLED.addLeds<P9813, DATA_PIN, CLOCK_PIN, RGB>(leds, NUM_LEDS);
       // FastLED.addLeds<APA102, DATA_PIN, CLOCK_PIN, RGB>(leds, NUM_LEDS);
       // FastLED.addLeds<DOTSTAR, DATA_PIN, CLOCK_PIN, RGB>(leds, NUM_LEDS);
@@ -48,12 +48,18 @@ void setup() {
 void loop() { 
   // Turn the LED on, then pause
   leds[0] = CRGB::Red;
-  Serial.printf("red\n");
+  leds[1] = CRGB::Blue;
+  leds[2] = CRGB::Green;
+  leds[3] = CRGB::Pink;
+  Serial.printf("on\n");
   FastLED.show();
   delay(500);
   // Now turn the LED off, then pause
   leds[0] = CRGB::Black;
-  Serial.printf("black\n");
+  leds[1] = CRGB::Black;
+  leds[2] = CRGB::Black;
+  leds[3] = CRGB::Black;
+  Serial.printf("off\n");
   FastLED.show();
   delay(500);
 }
